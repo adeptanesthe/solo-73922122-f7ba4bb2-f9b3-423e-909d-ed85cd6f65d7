@@ -24,6 +24,7 @@
     padding: 18px 20px; margin-bottom: 18px;
   }
   .card h2 { margin: 0 0 12px; font-size: 16px; }
+  .card h2 .side { float: right; font-size: 13px; font-weight: 500; }
   .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
   button {
     border: 1px solid var(--blue); background: var(--blue); color: #fff;
@@ -46,6 +47,7 @@
   .badge.drive { background: #fef3c7; color: #92400e; }
   .badge.control { background: #dbeafe; color: #1e40af; }
   .badge.none { background: #e2e8f0; color: #475569; }
+  .badge.batch { background: #e0e7ff; color: #3730a3; }
   .alert {
     border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 12px;
   }
@@ -53,6 +55,7 @@
   .alert.info { background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; }
   .alert.ok { background: #f0fdf4; border: 1px solid #bbf7d0; color: var(--green); }
   .alert.err { background: #fef2f2; border: 1px solid #fecaca; color: var(--red); }
+  .alert .close { float: right; cursor: pointer; font-weight: 700; }
   .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
   .stat {
     border: 1px solid var(--line); border-radius: 8px; padding: 12px;
@@ -81,28 +84,35 @@
 </header>
 <main>
   <section class="card">
-    <h2>1. 上传批次 CSV</h2>
+    <h2>1. 上传批次 CSV
+      <span class="side muted" id="currentBatchText">当前批次：未建立</span>
+    </h2>
+    <div id="staleBanner"></div>
     <div class="row">
       <input type="file" id="file" accept=".csv,text/csv" />
       <button id="uploadBtn">上传并建立批次</button>
-      <span class="muted">表头支持「机器编号, 初判」或「id, initial」；类别写 电源/power、驱动/drive、控制/control</span>
+      <span class="muted">每次上传都另开一批（重传同一文件也一样）；表头支持「机器编号, 初判」或「id, initial」，类别写 电源/power、驱动/drive、控制/control</span>
     </div>
   </section>
 
   <section class="card" id="estimateCard" hidden>
-    <h2>2. 估算结果</h2>
+    <h2>2. 估算结果
+      <span class="side"><span class="badge batch" id="estimateBatchBadge"></span></span>
+    </h2>
     <div id="alertBox"></div>
     <div class="row" style="margin-bottom:12px">
       <span class="muted" id="progressText"></span>
       <button class="ghost small" id="refreshBtn">立即刷新</button>
-      <span class="muted">页面每 3 秒自动同步一次拆检记录（多窗口协同）</span>
+      <span class="muted">页面每 3 秒自动同步一次拆检记录（多窗口协同）；换批后自动切到新批</span>
     </div>
     <div class="grid3" id="statGrid"></div>
     <div id="fitDetail" style="margin-top:14px"></div>
   </section>
 
   <section class="card" id="machineCard" hidden>
-    <h2>3. 拆检登记 / 更正 / 撤回</h2>
+    <h2>3. 拆检登记 / 更正 / 撤回
+      <span class="side"><span class="badge batch" id="machineBatchBadge"></span></span>
+    </h2>
     <div class="row filters" style="margin-bottom:10px">
       <span class="muted">筛选：</span>
       <button class="ghost small on" data-filter="all">全部</button>
@@ -130,9 +140,13 @@
 <script>
 const CATS = ["power", "drive", "control"];
 const LABELS = {power: "电源", drive: "驱动", control: "控制"};
-let state = null;
+let state = null;          // 当前页面展示的批次快照（含 batch_id）
 let filter = "all";
 let pollTimer = null;
+// 单调请求序号：只接受最新一次请求的响应，迟到的旧批响应一律丢弃，
+// 防止其把页面恢复成旧清单/旧估数。
+let requestSeq = 0;
+let staleNotice = null;    // 换批后待班组重新操作的横幅内容
 
 function toast(msg, isErr) {
   const el = document.getElementById("toast");
@@ -140,7 +154,7 @@ function toast(msg, isErr) {
   el.className = isErr ? "err" : "";
   el.style.display = "block";
   clearTimeout(el._t);
-  el._t = setTimeout(() => { el.style.display = "none"; }, 3200);
+  el._t = setTimeout(() => { el.style.display = "none"; }, 4000);
 }
 function fmt(x, digits = 4) {
   if (x === null || x === undefined) return "—";
@@ -151,11 +165,33 @@ function badge(cat) {
   return `<span class="badge ${cat}">${LABELS[cat]}</span>`;
 }
 
+/**
+ * 统一请求入口。
+ * 返回 {status, data}；调用方通过 takeSeq() 取得的序号判断响应是否过期。
+ */
 async function api(path, options) {
   const resp = await fetch(path, options);
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data.detail || ("请求失败：" + resp.status));
-  return data;
+  return {status: resp.status, data};
+}
+function takeSeq() { return ++requestSeq; }
+function isStale(seq) { return seq !== requestSeq; }
+
+function showStaleNotice(message) {
+  staleNotice = message;
+  renderStaleBanner();
+}
+function clearStaleNotice() {
+  staleNotice = null;
+  renderStaleBanner();
+}
+function renderStaleBanner() {
+  const box = document.getElementById("staleBanner");
+  if (!staleNotice) { box.innerHTML = ""; return; }
+  box.innerHTML =
+    `<div class="alert err">${staleNotice}
+       <span class="close" onclick="clearStaleNotice()">×</span>
+     </div>`;
 }
 
 document.getElementById("uploadBtn").addEventListener("click", async () => {
@@ -163,11 +199,19 @@ document.getElementById("uploadBtn").addEventListener("click", async () => {
   if (!f) return toast("请先选择 CSV 文件", true);
   const fd = new FormData();
   fd.append("file", f);
+  const seq = takeSeq();  // 上传后所有在途旧响应全部作废
   try {
-    state = await api("/api/batch", {method: "POST", body: fd});
-    toast(`已载入 ${state.estimate.n_total} 台机器`);
+    const {status, data} = await api("/api/batch", {method: "POST", body: fd});
+    if (isStale(seq)) return;  // 迟到的旧上传响应不允许覆盖更新的批次
+    if (status !== 200) throw new Error(data.detail || ("请求失败：" + status));
+    const previousId = state ? state.batch_id : null;
+    state = data;
+    clearStaleNotice();
+    toast(previousId
+      ? `已另开新批 ${data.batch_id}，载入 ${data.estimate.n_total} 台机器（旧批 ${previousId} 已停用）`
+      : `已建立批次 ${data.batch_id}，载入 ${data.estimate.n_total} 台机器`);
     render();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) { if (!isStale(seq)) toast(e.message, true); }
 });
 
 document.getElementById("refreshBtn").addEventListener("click", refresh);
@@ -180,35 +224,85 @@ document.querySelectorAll(".filters button").forEach(btn => {
   });
 });
 
+/** 拉取当前批次；若与页面展示的批次不同，整体切换到新批。 */
 async function refresh() {
+  const seq = takeSeq();
   try {
-    state = await api("/api/batch");
+    const {status, data} = await api("/api/batch");
+    if (isStale(seq)) return;  // 迟到响应（含旧批 GET 响应）一律丢弃
+    if (status === 404) {
+      state = null;
+      document.getElementById("estimateCard").hidden = true;
+      document.getElementById("machineCard").hidden = true;
+      document.getElementById("currentBatchText").textContent = "当前批次：未建立";
+      return;
+    }
+    if (status !== 200) throw new Error(data.detail || ("请求失败：" + status));
+    const previousId = state ? state.batch_id : null;
+    const switched = previousId !== null && previousId !== data.batch_id;
+    state = data;
+    if (switched) {
+      showStaleNotice(
+        `检测到批次已由 <b>${previousId}</b> 切换为当前批次 ` +
+        `<b>${data.batch_id}</b>，页面已同步为新批清单与估数；` +
+        `请核对后在当前批次重新登记。`);
+      toast(`已切换到新批 ${data.batch_id}`);
+    }
     render();
-  } catch (e) { /* 批次不存在等情况静默 */ }
+  } catch (e) { if (!isStale(seq)) toast(e.message, true); }
 }
 
-async function inspect(id, category) {
+/** 写入类操作：只对点击时页面显示的批次生效。 */
+async function sendInspection(id, category, actionLabel) {
+  if (!state) return toast("尚未上传批次，请先上传 CSV", true);
+  const batchId = state.batch_id;  // 点击瞬间记录页面批次
+  const seq = takeSeq();
   try {
-    state = await api(`/api/machines/${encodeURIComponent(id)}/inspect`, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({category}),
-    });
+    const {status, data} = await api(
+      `/api/machines/${encodeURIComponent(id)}/${category === null ? "withdraw" : "inspect"}`,
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(category === null
+          ? {batch_id: batchId}
+          : {batch_id: batchId, category}),
+      });
+    if (isStale(seq)) return;  // 迟到响应不能恢复旧清单/旧估数
+    if (status === 409) {
+      // 写入前已换批：拒绝生效，提示并同步当前批次
+      const cur = data.current_batch_id || "未知";
+      showStaleNotice(
+        `${actionLabel}被拒绝：该操作属于旧批 <b>${batchId}</b>，` +
+        `当前批次为 <b>${cur}</b>，本次修改未写入。页面已同步当前批次，` +
+        `请在 <b>${cur}</b> 重新操作。`);
+      toast("批次已切换，操作未生效，请按当前批次重新操作", true);
+      await refresh();
+      return;
+    }
+    if (status !== 200) throw new Error(data.detail || ("请求失败：" + status));
+    state = data;
+    clearStaleNotice();  // 当前批次写入成功，撤下换批提示
     render();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) { if (!isStale(seq)) toast(e.message, true); }
 }
-async function withdraw(id) {
-  try {
-    state = await api(`/api/machines/${encodeURIComponent(id)}/withdraw`,
-      {method: "POST"});
-    render();
-  } catch (e) { toast(e.message, true); }
+
+function inspect(id, category) {
+  return sendInspection(id, category, `机器 ${id} 的登记/更正`);
+}
+function withdraw(id) {
+  return sendInspection(id, null, `机器 ${id} 的撤回`);
 }
 
 function render() {
   if (!state) return;
   document.getElementById("estimateCard").hidden = false;
   document.getElementById("machineCard").hidden = false;
+  document.getElementById("currentBatchText").textContent =
+    `当前批次：${state.batch_id}`;
+  document.getElementById("estimateBatchBadge").textContent =
+    `批次 ${state.batch_id}`;
+  document.getElementById("machineBatchBadge").textContent =
+    `批次 ${state.batch_id}`;
   renderEstimate();
   renderMachines();
   if (!pollTimer) pollTimer = setInterval(refresh, 3000);
@@ -309,6 +403,7 @@ function renderMachines() {
 // 暴露给内联 onclick
 window.inspect = inspect;
 window.withdraw = withdraw;
+window.clearStaleNotice = clearStaleNotice;
 refresh();
 </script>
 </body>
